@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: bot-telegram
+    runtime: python
+    buildCommand: ""
+    startCommand: python bot.py
+    plan: free
