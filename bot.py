@@ -69,6 +69,7 @@ class WebhookHandler(BaseHTTPRequestHandler):
         else:
             self.send_response(404)
             self.end_headers()    
+            
     def do_POST(self):
         if self.path != "/webhook":
             self.send_response(404)
@@ -121,10 +122,12 @@ class WebhookHandler(BaseHTTPRequestHandler):
 
 # Função para rodar o servidor HTTP em uma thread separada
 def run_http_server():
-    server_address = ("0.0.0.0", 5000)
+    port = int(os.environ.get("PORT", 5000))  # Pega a porta definida pelo Render
+    server_address = ("0.0.0.0", port)
     httpd = ThreadingHTTPServer(server_address, WebhookHandler)
-    logger.info("Servidor HTTP iniciado em http://0.0.0.0:5000")
+    logger.info(f"Servidor HTTP iniciado em http://0.0.0.0:{port}")
     httpd.serve_forever()
+
 
 # Função para o comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
