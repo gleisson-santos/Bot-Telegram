@@ -60,6 +60,15 @@ class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 # Manipulador de requisições HTTP
 class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/ping":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Pong! Online")
+        else:
+            self.send_response(404)
+            self.end_headers()    
     def do_POST(self):
         if self.path != "/webhook":
             self.send_response(404)
