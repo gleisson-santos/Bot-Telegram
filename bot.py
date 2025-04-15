@@ -1,71 +1,307 @@
 import os
 import logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
+import json
+import requests
+from datetime import datetime
+from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Bot, Update
-from telegram.ext import CommandHandler, MessageHandler, filters, Application, ContextTypes
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+from threading import Thread
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from collections import defaultdict
+import asyncio
 
-# Carrega variáveis do .env
-load_dotenv()
-
-# Configurações
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL")
-CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-
-# Logger
-logging.basicConfig(level=logging.INFO)
+# Configuração de logging para depuração
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# Cria aplicação do bot
-app = Application.builder().token(TOKEN).build()
-bot = Bot(token=TOKEN)
+# Carrega variáveis de ambiente do arquivo .env
+logger.info("Tentando carregar o arquivo .env...")
+load_dotenv()
+logger.info("Arquivo .env carregado com sucesso.")
 
-# Comando de inicialização
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Olá! Envie uma imagem e uma legenda que eu reenviarei para o canal.")
+# Verifica o caminho do arquivo .env
+env_path = Path(".") / ".env"
+logger.info(f"Procurando o arquivo .env em: {env_path.resolve()}")
 
-app.add_handler(CommandHandler("start", start))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-# Tratador de mensagens com imagem
-async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    caption = message.caption or ""
+# Verifica se as variáveis de ambiente estão definidas
+if not TELEGRAM_TOKEN or not MAKE_WEBHOOK_URL or not TELEGRAM_CHANNEL_ID:
+    logger.error("As variáveis TELEGRAM_TOKEN, MAKE_WEBHOOK_URL e TELEGRAM_CHANNEL_ID não foram encontradas.")
+    logger.error(f"TELEGRAM_TOKEN: {TELEGRAM_TOKEN}")
+    logger.error(f"MAKE_WEBHOOK_URL: {MAKE_WEBHOOK_URL}")
+    logger.error(f"TELEGRAM_CHANNEL_ID: {TELEGRAM_CHANNEL_ID}")
+    raise ValueError("As variáveis TELEGRAM_TOKEN, MAKE_WEBHOOK_URL e TELEGRAM_CHANNEL_ID devem ser definidas no arquivo .env")
+logger.info("Variáveis TELEGRAM_TOKEN, MAKE_WEBHOOK_URL e TELEGRAM_CHANNEL_ID carregadas com sucesso.")
 
-    if message.photo:
-        # Seleciona a imagem com maior resolução
-        photo = message.photo[-1]
-        file_id = photo.file_id
+# Diretório para armazenar imagens temporariamente
+IMAGE_DIR = Path("images")
+IMAGE_DIR.mkdir(exist_ok=True)
 
-        # Envia imagem ao canal
-        await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=caption)
-        logger.info("Imagem enviada para o canal.")
-    else:
-        await message.reply_text("Por favor, envie uma imagem com uma legenda.")
+# Inicializa a aplicação do Telegram
+application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+# Dicionário para armazenar imagens de uma galeria por media_group_id
+media_groups = defaultdict(list)
+processed_media_groups = set()
 
-# Webhook handler
+# Classe para o servidor HTTP
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Classe que permite lidar com requisições em threads separadas."""
+    pass
+
+# Manipulador de requisições HTTP
 class WebhookHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/ping":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Pong! Online")
+        else:
+            self.send_response(404)
+            self.end_headers()    
+            
     def do_POST(self):
-        length = int(self.headers['Content-Length'])
-        data = self.rfile.read(length)
+        if self.path != "/webhook":
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "error", "message": "Endpoint não encontrado"}).encode('utf-8'))
+            return
 
-        update = Update.de_json(data.decode("utf-8"), bot)
-        app.update_queue.put(update)
+        try:
+            # Lê o corpo da requisição
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            data = json.loads(post_data.decode('utf-8'))
 
-        self.send_response(200)
-        self.end_headers()
+            if "file_url" not in data:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": "file_url não fornecido"}).encode('utf-8'))
+                return
 
-def run_webhook_server():
-    port = int(os.getenv("PORT", 5000))
-    server = HTTPServer(("0.0.0.0", port), WebhookHandler)
-    logger.info(f"🌐 Servidor Webhook rodando na porta {port}")
-    server.serve_forever()
+            file_url = data["file_url"]
+            caption = data.get("caption", "Imagem processada e enviada pelo bot.")
+            source_chat_name = data.get("source_chat_name", "Desconhecido")
+            source_chat_id = data.get("source_chat_id", "Desconhecido")
+            logger.info("Recebido file_url do Make.com: %s", file_url)
+
+            # Envia a imagem para o canal do Telegram com o caption original
+            loop = asyncio.get_event_loop()
+            send_photo_coro = application.bot.send_photo(
+                chat_id=TELEGRAM_CHANNEL_ID,
+                photo=file_url,
+                caption=caption
+            )
+            asyncio.run_coroutine_threadsafe(send_photo_coro, loop).result()
+            logger.info("Imagem enviada para o canal %s com caption: %s", TELEGRAM_CHANNEL_ID, caption)
+
+            # Responde com sucesso
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success", "message": "Imagem enviada ao canal"}).encode('utf-8'))
+
+        except Exception as e:
+            logger.error("Erro ao processar requisição do Make.com: %s", str(e))
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "error", "message": str(e)}).encode('utf-8'))
+
+# Função para rodar o servidor HTTP em uma thread separada
+def run_http_server():
+    port = int(os.environ.get("PORT", 5000))  # Pega a porta definida pelo Render
+    server_address = ("0.0.0.0", port)
+    httpd = ThreadingHTTPServer(server_address, WebhookHandler)
+    logger.info(f"Servidor HTTP iniciado em http://0.0.0.0:{port}")
+    httpd.serve_forever()
+
+
+# Função para o comando /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("Comando /start recebido de %s", update.effective_user.id)
+    await update.message.reply_text("Olá! Envie uma imagem ou galeria para que eu a processe.")
+
+# Função para processar imagens (incluindo galerias)
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    media_group_id = message.media_group_id
+    chat_id = message.chat_id
+    message_id = message.message_id
+
+    # Captura o caption da mensagem
+    caption = message.caption if message.caption else ""
+    logger.info("Caption da mensagem: %s", caption)
+
+    # Determina o chat de origem (se a mensagem foi encaminhada, usa forward_from_chat; caso contrário, usa o chat atual)
+    source_chat_name = ""
+    source_chat_id = ""
+    # Verifica se a mensagem foi encaminhada usando forward_date ou forward_from
+    if hasattr(message, 'forward_date') and message.forward_date:
+        if hasattr(message, 'forward_from_chat') and message.forward_from_chat:
+            source_chat_name = message.forward_from_chat.title if message.forward_from_chat.title else (message.forward_from_chat.username or "Chat Desconhecido")
+            source_chat_id = str(message.forward_from_chat.id)
+            logger.info("Mensagem encaminhada - Chat de Origem - Nome: %s, ID: %s", source_chat_name, source_chat_id)
+        else:
+            source_chat_name = "Chat Desconhecido (Encaminhado)"
+            source_chat_id = "Desconhecido"
+            logger.info("Mensagem encaminhada, mas forward_from_chat não disponível")
+    else:
+        source_chat_name = message.chat.title if message.chat.title else (message.chat.username or message.chat.first_name or "Chat Privado")
+        source_chat_id = str(chat_id)
+        logger.info("Mensagem não encaminhada - Chat de Origem - Nome: %s, ID: %s", source_chat_name, source_chat_id)
+
+    # Se não for parte de uma galeria, processa imediatamente
+    if not media_group_id:
+        logger.info("Imagem única recebida de %s (message_id: %s)", update.effective_user.id, message_id)
+        await process_single_image(update, context, caption, source_chat_name, source_chat_id)
+        return
+
+    # Se for parte de uma galeria, agrupa as imagens
+    logger.info("Imagem de galeria recebida de %s (media_group_id: %s, message_id: %s)", update.effective_user.id, media_group_id, message_id)
+
+    # Verifica se a galeria já foi processada
+    if media_group_id in processed_media_groups:
+        logger.info("Galeria já processada, ignorando: %s", media_group_id)
+        return
+
+    # Armazena as imagens da galeria junto com o caption, source_chat_name e source_chat_id
+    media_groups[media_group_id].append((update, caption, source_chat_name, source_chat_id))
+
+    # Aguarda brevemente para garantir que todas as imagens da galeria foram recebidas
+    await asyncio.sleep(2)  # Ajuste o tempo conforme necessário
+
+    # Verifica se é a última imagem da galeria
+    if media_group_id in media_groups:
+        updates_with_metadata = media_groups[media_group_id]
+        logger.info("Processando galeria com media_group_id %s: %d imagens recebidas", media_group_id, len(updates_with_metadata))
+
+        # Seleciona a imagem de maior resolução entre todas as imagens da galeria
+        highest_resolution_photo = None
+        highest_resolution_update = None
+        selected_caption = None
+        selected_source_chat_name = None
+        selected_source_chat_id = None
+        max_resolution = 0
+
+        for u, cap, name, cid in updates_with_metadata:
+            photo = max(
+                u.message.photo,
+                key=lambda photo: photo.width * photo.height  # Correção: substitui p por photo
+            )
+            resolution = photo.width * photo.height
+            if resolution > max_resolution:
+                max_resolution = resolution
+                highest_resolution_photo = photo
+                highest_resolution_update = u
+                selected_caption = cap
+                selected_source_chat_name = name
+                selected_source_chat_id = cid
+
+        if highest_resolution_photo:
+            logger.info("Imagem de maior resolução selecionada para media_group_id %s: %dx%d", media_group_id, highest_resolution_photo.width, highest_resolution_photo.height)
+            await process_single_image(highest_resolution_update, context, selected_caption, selected_source_chat_name, selected_source_chat_id)
+
+        # Marca a galeria como processada e limpa o dicionário
+        processed_media_groups.add(media_group_id)
+        del media_groups[media_group_id]
+        logger.info("Galeria processada e removida: %s", media_group_id)
+
+# Função para processar uma única imagem (usada para imagens avulsas ou a imagem selecionada da galeria)
+async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYPE, caption: str, source_chat_name: str, source_chat_id: str) -> None:
+    try:
+        # Verifica se a mensagem contém uma foto
+        if not update.message.photo:
+            await update.message.reply_text("Por favor, envie uma imagem válida.")
+            return
+
+        # Seleciona a imagem de maior resolução (já foi selecionada no caso de galerias)
+        highest_resolution_photo = max(
+            update.message.photo,
+            key=lambda photo: photo.width * photo.height
+        )
+        file_id = highest_resolution_photo.file_id
+        file = await context.bot.get_file(file_id)
+
+        # Gera um nome de arquivo único baseado no timestamp e ID do usuário
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        user_id = update.effective_user.id
+        file_name = f"image_{user_id}_{timestamp}.jpg"
+        file_path = IMAGE_DIR / file_name
+
+        # Baixa a imagem
+        await file.download_to_drive(file_path)
+        logger.info("Imagem de maior resolução baixada com sucesso: %s", file_path)
+
+        # Envia os dados para o Make.com, incluindo o caption, source_chat_name e source_chat_id
+        await send_to_make(file.file_path, file_path, update, context, caption, source_chat_name, source_chat_id)
+
+        await update.message.reply_text("Imagem de maior resolução recebida e processada com sucesso! Os dados foram enviados para o Make.com.")
+
+    except Exception as e:
+        logger.error("Erro ao processar a imagem: %s", str(e))
+        await update.message.reply_text("Ocorreu um erro ao processar a imagem. Tente novamente mais tarde.")
+
+# Função para enviar dados ao Make.com
+async def send_to_make(file_url: str, file_path: Path, update: Update, context: ContextTypes.DEFAULT_TYPE, caption: str, source_chat_name: str, source_chat_id: str) -> None:
+    try:
+        # Prepara os dados para enviar ao Make.com, incluindo o caption, source_chat_name e source_chat_id
+        payload = {
+            "user_id": update.effective_user.id,
+            "username": update.effective_user.username,
+            "file_url": file_url,  # URL da imagem no Telegram
+            "timestamp": datetime.now().isoformat(),
+            "caption": caption,  # Inclui o caption da mensagem original
+            "source_chat_name": source_chat_name,  # Inclui o nome do chat de origem
+            "source_chat_id": source_chat_id  # Inclui o ID do chat de origem (de onde o caption foi obtido)
+        }
+
+        # Envia a requisição para o webhook do Make.com
+        response = requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=10)
+        response.raise_for_status()  # Levanta uma exceção se a requisição falhar
+        logger.info("Dados enviados ao Make.com com sucesso: %s", response.status_code)
+
+    except requests.exceptions.RequestException as e:
+        logger.error("Erro ao enviar dados para o Make.com: %s", str(e))
+        await update.message.reply_text("Erro ao enviar os dados para o Make.com. Tente novamente mais tarde.")
+    finally:
+        # Remove o arquivo temporário após o envio
+        if file_path.exists():
+            file_path.unlink()
+            logger.info("Arquivo temporário removido: %s", file_path)
+
+# Função para lidar com erros do bot
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error("Erro no bot: %s", context.error)
+    if update and update.message:
+        await update.message.reply_text("Ocorreu um erro interno. Por favor, tente novamente.")
+
+# Função principal
+def main() -> None:
+    # Adiciona os handlers do Telegram
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_error_handler(error_handler)
+
+    # Inicia o servidor HTTP em uma thread separada
+    http_thread = Thread(target=run_http_server)
+    http_thread.start()
+
+    logger.info("Bot iniciado, aguardando mensagens...")
+    # Inicia o bot do Telegram
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    logger.info("🤖 Iniciando bot com Webhook...")
-    bot.delete_webhook()
-    bot.set_webhook(url=WEBHOOK_URL)
-    Thread(target=run_webhook_server).start()
+    main()
