@@ -1,64 +1,71 @@
 import os
 import logging
-import requests
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from threading import Thread
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram import Bot, Update
+from telegram.ext import CommandHandler, MessageHandler, filters, Application, ContextTypes
 
 # Carrega variáveis do .env
 load_dotenv()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+# Configurações
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL")
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
-# Configuração de log
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+# Logger
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Criação do aplicativo do Telegram
-app = Application.builder().token(TELEGRAM_TOKEN).build()
+# Cria aplicação do bot
+app = Application.builder().token(TOKEN).build()
+bot = Bot(token=TOKEN)
 
-# Função para lidar com fotos enviadas
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Comando de inicialização
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Olá! Envie uma imagem e uma legenda que eu reenviarei para o canal.")
+
+app.add_handler(CommandHandler("start", start))
+
+# Tratador de mensagens com imagem
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
+    caption = message.caption or ""
 
-    if not message or not message.photo:
-        return
+    if message.photo:
+        # Seleciona a imagem com maior resolução
+        photo = message.photo[-1]
+        file_id = photo.file_id
 
-    caption = message.caption or "sem legenda"
-    username = message.from_user.username or "desconhecido"
-    file_id = message.photo[-1].file_id  # Última é a de melhor qualidade
+        # Envia imagem ao canal
+        await bot.send_photo(chat_id=CHANNEL_ID, photo=file_id, caption=caption)
+        logger.info("Imagem enviada para o canal.")
+    else:
+        await message.reply_text("Por favor, envie uma imagem com uma legenda.")
 
-    # Envia para canal
-    await context.bot.send_photo(
-        chat_id=TELEGRAM_CHANNEL_ID,
-        photo=file_id,
-        caption=f"🧠 Prompt de @{username}:\n\n{caption}",
-    )
+app.add_handler(MessageHandler(filters.PHOTO, handle_image))
 
-    # Envia para webhook do MAKE
-    payload = {
-        "username": username,
-        "caption": caption,
-        "file_id": file_id,
-        "chat_id": message.chat.id,
-        "message_id": message.message_id,
-    }
+# Webhook handler
+class WebhookHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers['Content-Length'])
+        data = self.rfile.read(length)
 
-    try:
-        response = requests.post(MAKE_WEBHOOK_URL, json=payload)
-        response.raise_for_status()
-        logger.info("✅ Dados enviados para o Make com sucesso.")
-    except Exception as e:
-        logger.error(f"❌ Erro ao enviar dados para o Make: {e}")
+        update = Update.de_json(data.decode("utf-8"), bot)
+        app.update_queue.put(update)
 
-# Adiciona o handler para mensagens com foto
-app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+        self.send_response(200)
+        self.end_headers()
 
-# Inicializa o bot com polling
+def run_webhook_server():
+    port = int(os.getenv("PORT", 5000))
+    server = HTTPServer(("0.0.0.0", port), WebhookHandler)
+    logger.info(f"🌐 Servidor Webhook rodando na porta {port}")
+    server.serve_forever()
+
 if __name__ == "__main__":
-    logger.info("🤖 Bot está rodando...")
-    app.run_polling(drop_pending_updates=True)
+    logger.info("🤖 Iniciando bot com Webhook...")
+    bot.delete_webhook()
+    bot.set_webhook(url=WEBHOOK_URL)
+    Thread(target=run_webhook_server).start()
