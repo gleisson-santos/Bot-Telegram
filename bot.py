@@ -248,7 +248,7 @@ async def process_single_image(update: Update, context: ContextTypes.DEFAULT_TYP
         # Envia os dados para o Make.com, incluindo o caption, source_chat_name e source_chat_id
         await send_to_make(file.file_path, file_path, update, context, caption, source_chat_name, source_chat_id)
 
-        await update.message.reply_text("Imagem de maior resolução recebida e processada com sucesso! Os dados foram enviados para o Make.com.")
+        await update.message.reply_text("")
 
     except Exception as e:
         logger.error("Erro ao processar a imagem: %s", str(e))
